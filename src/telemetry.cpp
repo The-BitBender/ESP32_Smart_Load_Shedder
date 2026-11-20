@@ -1,14 +1,9 @@
 #include "telemetry.h"
 #include <WiFi.h>
 #include <WiFiManager.h>
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
+#include <WebSocketsClient.h>
 #include <ArduinoJson.h>
-#include <memory>
 #include <time.h>
-
-// All WiFi handling (WiFiManager portal, reconnects, NTP) and the HTTP uploads live in this one
-// FreeRTOS task, so network problems can never stall metering or load shedding in loop().
 
 namespace telemetry {
 namespace {
@@ -17,88 +12,79 @@ SemaphoreHandle_t g_mtx = nullptr;
 Snapshot          g_snap;
 bool              g_have = false;
 NetInfo           g_net;
-volatile int8_t   g_lastOk = -1;
-volatile uint32_t g_lastPostAt = 0;
+
 volatile bool     g_reqPortal = false;
+volatile bool     g_wsUp = false;
+volatile bool     g_txNow = false;
+volatile bool     g_haveTx = false;
+volatile uint32_t g_lastTxAt = 0;
+
+QueueHandle_t     g_inQ = nullptr;     // String*  server  -> main loop
+QueueHandle_t     g_outQ = nullptr;    // String*  main loop -> server
+WebSocketsClient  g_ws;
 
 inline float rnd(float v, int d) {
   float k = powf(10.0f, d);
   return roundf(v * k) / k;
 }
 
-String buildPayload(const Snapshot& s) {
+void flushOut() {
+  String* p = nullptr;
+  while (xQueueReceive(g_outQ, &p, 0) == pdTRUE) delete p;
+}
+
+// Frame layout follows the web app's telemetry sample; relayStates is an additive field.
+String buildTelemetry(const Snapshot& s) {
   JsonDocument doc;
-  const time_t t = time(nullptr);
-
-  doc["device_id"] = DEVICE_ID;
-  doc["fw"]        = FW_VERSION;
-  doc["ts"]        = (t > 1700000000) ? (uint32_t)t : 0;   // UTC epoch, 0 until NTP syncs
-  doc["uptime_s"]  = s.uptimeS;
-  doc["rssi"]      = WiFi.RSSI();
-
-  JsonObject sup = doc["supply"].to<JsonObject>();
-  sup["max_kw"]   = rnd(s.maxSupplyDeciKw / 10.0f, 1);
-  sup["load_kw"]  = rnd(s.m.power / 1000.0f, 3);
-  sup["load_pct"] = rnd(s.loadPct, 1);
-  sup["state"]    = supplyStateName(s.state);
-
-  JsonObject m = doc["meter"].to<JsonObject>();
-  m["valid"]      = s.m.valid;
-  m["voltage"]    = rnd(s.m.voltage, 1);
-  m["current"]    = rnd(s.m.current, 3);
-  m["power_w"]    = rnd(s.m.power, 1);
-  m["energy_kwh"] = rnd(s.m.energy, 3);
-  m["frequency"]  = rnd(s.m.frequency, 1);
-  m["pf"]         = rnd(s.m.pf, 2);
-
-  JsonArray arr = doc["channels"].to<JsonArray>();
-  for (uint8_t i = 0; i < cfg::NUM_CHANNELS; ++i) {
-    JsonObject c = arr.add<JsonObject>();
-    c["ch"]       = i + 1;
-    c["priority"] = priorityName(s.ch[i].prio);
-    c["on"]       = s.ch[i].on;
-    c["shed"]     = s.ch[i].shed;
-    c["est_w"]    = s.ch[i].known ? (int)s.ch[i].estW : -1;
-  }
+  doc["type"]               = "telemetry";
+  doc["power"]              = rnd(s.m.power, 1);          // W
+  doc["energy"]             = rnd(s.m.energy, 3);         // kWh
+  doc["voltage"]            = rnd(s.m.voltage, 1);        // V
+  doc["current"]            = rnd(s.m.current, 3);        // A
+  doc["frequency"]          = rnd(s.m.frequency, 1);      // Hz
+  doc["powerFactor"]        = rnd(s.m.pf, 2);
+  doc["sheddingActive"]     = s.sheddingActive;
+  doc["ackedConfigVersion"] = s.configVersion;
+  JsonArray rs = doc["relayStates"].to<JsonArray>();      // actual relay states, CH1..CH8
+  for (uint8_t i = 0; i < cfg::NUM_CHANNELS; ++i) rs.add(s.ch[i].on);
 
   String out;
   serializeJson(doc, out);
   return out;
 }
 
-bool postJson(const String& body) {
-  const bool https = strncmp(TELEMETRY_URL, "https://", 8) == 0;
-  std::unique_ptr<WiFiClient> client;
-  if (https) {
-    WiFiClientSecure* sc = new WiFiClientSecure();
-    sc->setInsecure();   // TODO production: sc->setCACert(rootCa) to validate the server
-    client.reset(sc);
-  } else {
-    client.reset(new WiFiClient());
-  }
-
-  HTTPClient http;
-  if (!http.begin(*client, TELEMETRY_URL)) return false;
-  http.setConnectTimeout(cfg::HTTP_TIMEOUT_MS);
-  http.setTimeout(cfg::HTTP_TIMEOUT_MS);
-  http.addHeader("Content-Type", "application/json");
-  if (strlen(TELEMETRY_API_KEY) > 0) http.addHeader("X-API-Key", TELEMETRY_API_KEY);
-
-  const int code = http.POST(body);
-  http.end();
-  Serial.printf("[TEL] POST -> %d\n", code);
-  return code >= 200 && code < 300;
-}
-
-void sendNow() {
+void sendTelemetry() {
   Snapshot s;
   if (xSemaphoreTake(g_mtx, pdMS_TO_TICKS(100)) != pdTRUE) return;
   s = g_snap;
   xSemaphoreGive(g_mtx);
 
-  const bool ok = postJson(buildPayload(s));
-  g_lastPostAt = millis();
-  g_lastOk = ok ? 1 : 0;
+  const String out = buildTelemetry(s);
+  g_ws.sendTXT(out.c_str());
+  g_lastTxAt = millis();
+  g_haveTx = true;
+}
+
+void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
+      g_wsUp = true;
+      g_txNow = true;                              // report immediately; the ack carries the settings
+      Serial.println("[CLOUD] connected");
+      break;
+    case WStype_DISCONNECTED:
+      g_wsUp = false;
+      Serial.println("[CLOUD] disconnected");
+      break;
+    case WStype_TEXT: {
+      String* m = new String();
+      m->concat((const char*)payload, (unsigned int)length);
+      if (xQueueSend(g_inQ, &m, 0) != pdTRUE) delete m;     // queue full: drop
+      break;
+    }
+    default:
+      break;
+  }
 }
 
 void updateNet(NetState st, WiFiManager& wm) {
@@ -112,6 +98,7 @@ void updateNet(NetState st, WiFiManager& wm) {
   if (st == NetState::Portal)  strlcpy(n.ip, WiFi.softAPIP().toString().c_str(), sizeof n.ip);
   else if (conn)               strlcpy(n.ip, WiFi.localIP().toString().c_str(), sizeof n.ip);
   n.rssi = conn ? WiFi.RSSI() : 0;
+  n.cloud = g_wsUp;
 
   if (xSemaphoreTake(g_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
     g_net = n;
@@ -134,7 +121,7 @@ void task(void*) {
   NetState st = NetState::Connecting;
   NetState lastSt = NetState::Offline;
   uint32_t stateSince = millis(), lastTry = millis(), lastNet = 0, nextSend = 0;
-  bool ntpStarted = false;
+  bool ntpStarted = false, wsStarted = false, wasConn = false;
 
   auto openPortal = [&]() {
     Serial.printf("[NET] setup portal: AP '%s'\n", PORTAL_AP_NAME);
@@ -191,15 +178,36 @@ void task(void*) {
 
     if (conn) {
       if (!ntpStarted) {
-        configTime(0, 0, "pool.ntp.org", "time.google.com");
+        configTzTime(TIMEZONE_POSIX, "pool.ntp.org", "time.google.com");
         ntpStarted = true;
         Serial.printf("[NET] connected to %s, IP %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
       }
-      if (g_have && reached(now, nextSend)) {
-        nextSend = now + cfg::TELEMETRY_INTERVAL_MS;   // fixed 30 s cadence, even after a failure
-        sendNow();
+      if (!wsStarted) {
+        g_ws.onEvent(wsEvent);
+        g_ws.beginSSL(WS_HOST, WS_PORT, WS_PATH, "", "");   // no cert pinning, no subprotocol
+        g_ws.setReconnectInterval(cfg::WS_RECONNECT_MS);
+        g_ws.enableHeartbeat(15000, 3000, 2);               // ping every 15 s, drop after 2 missed pongs
+        wsStarted = true;
       }
+      g_ws.loop();
+
+      if (g_wsUp) {
+        if (g_txNow) { g_txNow = false; nextSend = now; }
+
+        String* p = nullptr;                                // frames queued by the main loop
+        while (xQueueReceive(g_outQ, &p, 0) == pdTRUE) { g_ws.sendTXT(p->c_str()); delete p; }
+
+        if (g_have && reached(now, nextSend)) {
+          nextSend = now + cfg::TELEMETRY_INTERVAL_MS;      // fixed 30 s cadence
+          sendTelemetry();
+        }
+      }
+    } else if (wasConn) {                                   // WiFi just dropped
+      if (wsStarted) g_ws.disconnect();
+      g_wsUp = false;
+      flushOut();
     }
+    wasConn = conn;
 
     if (st != lastSt || now - lastNet >= 500) {
       lastSt = st;
@@ -207,14 +215,16 @@ void task(void*) {
       updateNet(st, wm);
     }
 
-    vTaskDelay(pdMS_TO_TICKS(st == NetState::Portal ? 10 : 200));
+    vTaskDelay(pdMS_TO_TICKS(st == NetState::Portal ? 10 : 20));
   }
 }
 
 }  // namespace
 
 void begin() {
-  g_mtx = xSemaphoreCreateMutex();
+  g_mtx  = xSemaphoreCreateMutex();
+  g_inQ  = xQueueCreate(6, sizeof(String*));
+  g_outQ = xQueueCreate(6, sizeof(String*));
   xTaskCreatePinnedToCore(task, "net", 12288, nullptr, 1, nullptr, 0);
 }
 
@@ -233,11 +243,27 @@ NetInfo netInfo() {
     xSemaphoreGive(g_mtx);
   }
   NetInfo n = cache;
-  n.lastPostOk = g_lastOk;
-  n.lastPostAgeS = (g_lastOk < 0) ? -1 : (int32_t)((millis() - g_lastPostAt) / 1000);
+  n.cloud = g_wsUp;
+  n.lastTxAgeS = g_haveTx ? (int32_t)((millis() - g_lastTxAt) / 1000) : -1;
   return n;
 }
 
 void startPortal() { g_reqPortal = true; }
+bool cloudConnected() { return g_wsUp; }
+
+bool sendText(const String& json) {
+  if (!g_wsUp) return false;
+  String* p = new String(json);
+  if (xQueueSend(g_outQ, &p, 0) != pdTRUE) { delete p; return false; }
+  return true;
+}
+
+bool pollInbound(String& out) {
+  String* p = nullptr;
+  if (xQueueReceive(g_inQ, &p, 0) != pdTRUE) return false;
+  out = *p;
+  delete p;
+  return true;
+}
 
 }  // namespace telemetry

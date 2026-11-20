@@ -1,13 +1,22 @@
 #include "load_manager.h"
 
-// Strategy
-//  * HIGH priority loads are critical: never shed, always energised.
-//  * On confirmed overload (P > max supply) or low voltage, shed ONE non-critical load,
-//    lowest priority first (ties: highest channel number first), then wait SETTLE_MS and re-evaluate.
-//  * Restore strictly by priority (HIGH -> LOW) once the supply has been stable for RESTORE_DELAY_MS
-//    and the learned size of the load fits under RESTORE_MARGIN x max supply.
-//  * The PZEM only measures the total, so each channel's size is learned from the power step
-//    observed when it is switched ON or OFF.
+// Channel model
+//   wanted(i) = what the user/schedule/peak policy allows (from the web app or local defaults):
+//     manualOverride         -> exactly targetState
+//     targetState == false   -> OFF
+//     schedule enabled       -> ON only inside the window
+//     peak hours enabled     -> LOW priority channels OFF inside the peak window
+//   Channels that are ON but not wanted are switched OFF (not counted as "shed").
+//
+// Automatic shedding (when autoSheddingEnabled)
+//   * "Critical" channels (HIGH priority or manualOverride) are never shed and always energised.
+//   * Confirmed overload (P > max supply) or low voltage: shed ONE wanted, non-critical load, lowest
+//     priority first (ties: highest channel number first), then wait SETTLE_MS and re-evaluate.
+//   * Restore strictly by priority once the supply has been stable for RESTORE_DELAY_MS and the
+//     learned size of the load fits under RESTORE_MARGIN x max supply.
+//   * The PZEM only measures the total, so each channel's size is learned from the power step
+//     observed when it is switched ON or OFF.
+// With autoSheddingEnabled == false the relays simply follow wanted().
 
 namespace loadmgr {
 namespace {
@@ -49,17 +58,17 @@ void postEvent(const char* title, uint8_t ch, Priority p, bool on) {
   Serial.printf("[LOAD] %s | %s\n", g_event.line1, g_event.line2);
 }
 
-void switchChannel(int i, bool on, float prePower, Priority p) {
+void switchChannel(int i, bool on, float prePower, Priority p, const char* title, bool shed) {
   relayWrite(i, on);
   g_ch[i].on = on;
-  g_ch[i].shed = !on;
+  g_ch[i].shed = shed;
   g_pend.active = true;
   g_pend.ch = i;
   g_pend.turnOn = on;
   g_pend.prePower = prePower;
   g_pend.at = millis();
   g_overTimer = false;
-  postEvent(on ? "LOAD RESTORED" : "LOAD SHED", i, p, on);
+  postEvent(title, i, p, on);
 }
 
 void finishLearning(float powerNow) {
@@ -73,23 +82,38 @@ void finishLearning(float powerNow) {
   Serial.printf("[LOAD] CH%u size ~%uW\n", g_pend.ch + 1, c.estW);
 }
 
-// Lowest priority first; ties -> highest channel number. HIGH is never returned.
+inline bool critical(const settings::Data& s, int i) {
+  return s.relay[i].prio == Priority::High || s.relay[i].manualOverride;
+}
+
+bool wanted(const settings::Data& s, int i, int minutes) {
+  const settings::RelayCfg& r = s.relay[i];
+  if (r.manualOverride) return r.targetState;
+  if (!r.targetState) return false;
+  if (minutes >= 0) {                                   // schedules/peak only apply once the clock is set
+    if (r.scheduleEnabled && !inWindow(minutes, r.schedStartMin, r.schedEndMin)) return false;
+    if (s.peakEnabled && r.prio == Priority::Low && inWindow(minutes, s.peakStartMin, s.peakEndMin)) return false;
+  }
+  return true;
+}
+
+// Lowest priority first; ties -> highest channel number. Critical channels are never returned.
 int pickShed(const settings::Data& s) {
   int best = -1;
   for (int i = N - 1; i >= 0; --i) {
-    if (!g_ch[i].on || s.prio[i] == Priority::High) continue;
-    if (best < 0 || s.prio[i] < s.prio[best]) best = i;
+    if (!g_ch[i].on || critical(s, i)) continue;
+    if (best < 0 || s.relay[i].prio < s.relay[best].prio) best = i;
   }
   return best;
 }
 
-// Highest priority first; ties -> lowest channel number.
-int pickRestore(const settings::Data& s, bool highOnly) {
+// Highest priority first; ties -> lowest channel number. Only channels that are wanted.
+int pickRestore(const settings::Data& s, const bool* want, bool criticalOnly) {
   int best = -1;
   for (int i = 0; i < N; ++i) {
-    if (g_ch[i].on) continue;
-    if (highOnly && s.prio[i] != Priority::High) continue;
-    if (best < 0 || s.prio[i] > s.prio[best]) best = i;
+    if (g_ch[i].on || !want[i]) continue;
+    if (criticalOnly && !critical(s, i)) continue;
+    if (best < 0 || s.relay[i].prio > s.relay[best].prio) best = i;
   }
   return best;
 }
@@ -107,40 +131,58 @@ void begin() {
 
 void update(const Metrics& m, const settings::Data& s) {
   const uint32_t now = millis();
+  const int minutes = minutesOfDayLocal();
 
-  // ---- Sensor fault: hold state, never shed blind, but keep critical loads powered ----
+  bool want[N];
+  for (int i = 0; i < N; ++i) {
+    want[i] = wanted(s, i, minutes);
+    if (!g_ch[i].on && !want[i]) g_ch[i].shed = false;   // off by choice, not shed
+  }
+
+  // ---- 1. Policy: switch off anything that is on but no longer wanted (one per tick) ----
+  for (int i = 0; i < N; ++i) {
+    if (g_ch[i].on && !want[i]) {
+      switchChannel(i, false, m.power, s.relay[i].prio, "RELAY OFF", false);
+      return;
+    }
+  }
+
+  // ---- 2. Sensor fault: never shed blind, but keep critical wanted loads powered ----
   if (!m.valid) {
     g_state = SupplyState::SensorFault;
     g_pend.active = false;
     g_overTimer = g_uvTimer = false;
     if (reached(now, g_restoreAllowedAt)) {
-      int h = pickRestore(s, true);
-      if (h >= 0) switchChannel(h, true, 0, s.prio[h]);
+      int h = pickRestore(s, want, true);
+      if (h >= 0) switchChannel(h, true, 0, s.relay[h].prio, "RELAY ON", false);
     }
     return;
   }
 
-  const float maxW = s.maxSupplyDeciKw * 100.0f;
+  const float maxW = (float)s.maxSupplyW;
   const bool severe = m.power > maxW * cfg::SEVERE_OVERLOAD_FACTOR;
 
-  // ---- Wait for a relay change to settle, then learn that channel's size ----
+  // ---- 3. Wait for a relay change to settle, then learn that channel's size ----
   if (g_pend.active) {
     if (severe)                                   g_pend.active = false;   // too dangerous to wait
     else if (!reached(now, g_pend.at + cfg::SETTLE_MS)) return;
     else                                          finishLearning(m.power);
   }
 
-  // ---- Low voltage (supply sag) with hysteresis ----
-  const bool uvLow = (m.voltage > cfg::MAINS_PRESENT_V && m.voltage < cfg::UNDERVOLT_TRIP_V);
+  // ---- 4. Low voltage (supply sag) with hysteresis; cutoff 0 disables it ----
+  const bool  uvEnabled = s.lowVoltageCutoff > 0;
+  const float uvTrip    = (float)s.lowVoltageCutoff;
+  const float uvClear   = uvTrip + cfg::UNDERVOLT_HYST_V;
+  const bool  uvLow     = uvEnabled && m.voltage > cfg::MAINS_PRESENT_V && m.voltage < uvTrip;
   if (uvLow) {
     if (!g_uvTimer) { g_uvTimer = true; g_uvSince = now; }
     if (reached(now, g_uvSince + cfg::UNDERVOLT_CONFIRM_MS)) g_uv = true;
   } else {
     g_uvTimer = false;
-    if (m.voltage >= cfg::UNDERVOLT_CLEAR_V || m.voltage <= cfg::MAINS_PRESENT_V) g_uv = false;
+    if (!uvEnabled || m.voltage >= uvClear || m.voltage <= cfg::MAINS_PRESENT_V) g_uv = false;
   }
 
-  // ---- Overload with confirmation timer ----
+  // ---- 5. Overload with confirmation timer ----
   const bool over = m.power > maxW;
   bool overConfirmed = false;
   if (over) {
@@ -150,37 +192,45 @@ void update(const Metrics& m, const settings::Data& s) {
     g_overTimer = false;
   }
 
-  // ---- Shed ----
-  if (overConfirmed || g_uv) {
-    g_state = overConfirmed ? SupplyState::Overload : SupplyState::Undervolt;
-    g_restoreAllowedAt = now + cfg::RESTORE_DELAY_MS;
-    int idx = pickShed(s);
-    if (idx >= 0) { switchChannel(idx, false, m.power, s.prio[idx]); return; }
-    // Nothing left to shed: still make sure critical loads are on.
-    int h = pickRestore(s, true);
-    if (h >= 0) switchChannel(h, true, m.power, s.prio[h]);
+  const bool stressed = overConfirmed || g_uv;
+  g_state = overConfirmed ? SupplyState::Overload : (g_uv ? SupplyState::Undervolt : SupplyState::Normal);
+
+  // ---- 6a. Automatic shedding disabled: relays just follow the wanted state ----
+  if (!s.autoShedding) {
+    int idx = pickRestore(s, want, false);
+    if (idx >= 0) switchChannel(idx, true, m.power, s.relay[idx].prio, "RELAY ON", false);
     return;
   }
 
-  g_state = SupplyState::Normal;
+  // ---- 6b. Shed ----
+  if (stressed) {
+    g_restoreAllowedAt = now + cfg::RESTORE_DELAY_MS;
+    int idx = pickShed(s);
+    if (idx >= 0) { switchChannel(idx, false, m.power, s.relay[idx].prio, "LOAD SHED", true); return; }
+    // Nothing left to shed: still make sure critical loads are on.
+    int h = pickRestore(s, want, true);
+    if (h >= 0) switchChannel(h, true, m.power, s.relay[h].prio, "LOAD RESTORED", false);
+    return;
+  }
+
   if (over) return;                                   // short spike: no restore yet
   if (!reached(now, g_restoreAllowedAt)) return;
 
-  // ---- Restore (strict priority order) ----
-  int idx = pickRestore(s, false);
+  // ---- 6c. Restore (strict priority order) ----
+  int idx = pickRestore(s, want, false);
   if (idx < 0) return;
-  if (s.prio[idx] != Priority::High) {
+  if (!critical(s, idx)) {
     const float need = g_ch[idx].known ? g_ch[idx].estW : cfg::UNKNOWN_LOAD_W;
     if (m.power + need > maxW * cfg::RESTORE_MARGIN) return;
   }
-  switchChannel(idx, true, m.power, s.prio[idx]);
+  switchChannel(idx, true, m.power, s.relay[idx].prio, "LOAD RESTORED", false);
 }
 
 SupplyState state() { return g_state; }
 
 void fillChannels(ChannelInfo* out, const settings::Data& s) {
   for (int i = 0; i < N; ++i) {
-    out[i].prio  = s.prio[i];
+    out[i].prio  = s.relay[i].prio;
     out[i].on    = g_ch[i].on;
     out[i].shed  = g_ch[i].shed;
     out[i].estW  = g_ch[i].estW;

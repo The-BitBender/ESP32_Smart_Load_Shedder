@@ -1,6 +1,10 @@
 #pragma once
 #include "types.h"
 
+// Network + cloud transport. Everything here runs in one background FreeRTOS task (core 0):
+// WiFiManager portal, reconnects, NTP, the WebSocket client and the 30 s telemetry frames.
+// The main loop only exchanges plain strings with it through thread-safe queues.
+
 namespace telemetry {
 
 enum class NetState : uint8_t {
@@ -15,13 +19,17 @@ struct NetInfo {
   char     ssid[33] = {0};      // connected SSID, or the saved one while connecting/offline
   char     ip[16] = {0};        // station IP, or the hotspot IP while the portal is open
   int16_t  rssi = 0;
-  int8_t   lastPostOk = -1;     // -1 = nothing sent yet, 0 = failed, 1 = OK
-  int32_t  lastPostAgeS = -1;   // seconds since the last upload attempt
+  bool     cloud = false;       // WebSocket to the web app is up
+  int32_t  lastTxAgeS = -1;     // seconds since the last telemetry frame (-1 = none yet)
 };
 
-void begin();                          // starts the background network + telemetry task (core 0)
-void publish(const Snapshot& s);       // hand the latest snapshot to the telemetry task
-NetInfo netInfo();                     // thread-safe copy of the current network status
-void startPortal();                    // ask the task to open the WiFiManager setup portal
+void begin();
+void publish(const Snapshot& s);       // latest snapshot for the 30 s telemetry frame
+NetInfo netInfo();                     // thread-safe copy of the network status
+void startPortal();                    // open the WiFiManager setup portal
+bool cloudConnected();
+
+bool sendText(const String& json);     // queue a text frame for the socket; false if it is down
+bool pollInbound(String& out);         // next text frame received from the server, if any
 
 }  // namespace telemetry

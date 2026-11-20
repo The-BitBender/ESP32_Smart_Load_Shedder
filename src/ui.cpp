@@ -12,7 +12,7 @@
 //   Menu    : tap = next item              hold = select
 //   Edit    : tap = change value           hold = next step / save
 // Row 0, column 16 of the first three pages carries a WiFi indicator:
-//   (wifi glyph) connected   ~ connecting   S setup portal open   x offline
+//   (wifi glyph) WiFi + cloud OK   ! WiFi OK but cloud down   ~ connecting   S setup portal   x offline
 // ---------------------------------------------------------------------------
 
 namespace ui {
@@ -55,9 +55,9 @@ void row(uint8_t r, const char* text) {
   lcd->print(buf);
 }
 
-char netIcon(NetState s) {
-  switch (s) {
-    case NetState::Connected:  return '\x01';    // custom wifi glyph
+char netIcon(const NetInfo& n) {
+  switch (n.state) {
+    case NetState::Connected:  return n.cloud ? '\x01' : '!';   // wifi glyph = WiFi + cloud OK
     case NetState::Connecting: return '~';
     case NetState::Portal:     return 'S';
     default:                   return 'x';
@@ -97,12 +97,12 @@ void handleButton(Btn b, uint32_t now) {
     case Screen::Menu:
       if (b == Btn::Short) { menuIdx = (menuIdx + 1) % MENU_ITEMS; break; }
       if (menuIdx == 0) {
-        edInt = s.maxSupplyDeciKw / 10;
-        edDec = s.maxSupplyDeciKw % 10;
+        edInt = s.maxSupplyW / 1000;
+        edDec = (s.maxSupplyW % 1000) / 100;
         screen = Screen::EditSupplyInt;
       } else if (menuIdx <= NCH) {
         editCh = menuIdx - 1;
-        edPrio = s.prio[editCh];
+        edPrio = s.relay[editCh].prio;
         screen = Screen::EditPriority;
       } else if (menuIdx == NCH + 1) {            // WiFi setup portal
         telemetry::startPortal();
@@ -119,17 +119,14 @@ void handleButton(Btn b, uint32_t now) {
       break;
 
     case Screen::EditSupplyInt:
-      if (b == Btn::Short) edInt = (edInt + 1) % (cfg::MAX_SUPPLY_DECI_KW / 10 + 1);
+      if (b == Btn::Short) edInt = (edInt + 1) % (cfg::MAX_SUPPLY_W / 1000 + 1);
       else                 screen = Screen::EditSupplyDec;
       break;
 
     case Screen::EditSupplyDec:
       if (b == Btn::Short) edDec = (edDec + 1) % 10;
       else {
-        uint16_t deci = edInt * 10 + edDec;
-        if (deci < cfg::MIN_SUPPLY_DECI_KW) deci = cfg::MIN_SUPPLY_DECI_KW;
-        if (deci > cfg::MAX_SUPPLY_DECI_KW) deci = cfg::MAX_SUPPLY_DECI_KW;
-        settings::setMaxSupply(deci);
+        settings::setMaxSupply(edInt * 1000u + edDec * 100u);   // clamped inside settings
         screen = Screen::Menu;
       }
       break;
@@ -176,11 +173,13 @@ void serverPage(const NetInfo& n, char* a, char* b, size_t sz) {
   if (n.state == NetState::Connected) snprintf(a, sz, "RSSI:%ddBm", (int)n.rssi);
   else                                snprintf(a, sz, "RSSI:--");
 
-  if (n.lastPostOk < 0) {
-    snprintf(b, sz, "Upload:--");
+  if (!n.cloud) {
+    snprintf(b, sz, "Cloud:Offline");
+  } else if (n.lastTxAgeS < 0) {
+    snprintf(b, sz, "Cloud:OK");
   } else {
-    const int age = n.lastPostAgeS;
-    snprintf(b, sz, "Upload:%s %d%c", n.lastPostOk ? "OK" : "ERR", age < 100 ? age : age / 60, age < 100 ? 's' : 'm');
+    const int age = n.lastTxAgeS;
+    snprintf(b, sz, "Cloud:OK Tx:%d%c", age < 100 ? age : age / 60, age < 100 ? 's' : 'm');
   }
 }
 
@@ -211,7 +210,7 @@ void drawMonitor(const Snapshot& s, uint32_t now) {
       break;
     }
     case 2:
-      snprintf(a, sizeof a, "Max:%.1fkW %3.0f%%", s.maxSupplyDeciKw / 10.0f, s.loadPct);
+      snprintf(a, sizeof a, "Max:%.1fkW %3.0f%%", s.maxSupplyW / 1000.0f, s.loadPct);
       snprintf(b, sizeof b, "Status:%s", supplyStateLcd(s.state));
       break;
     case 3:
@@ -234,7 +233,7 @@ void drawMonitor(const Snapshot& s, uint32_t now) {
 
   if (page < 3) {                                   // WiFi indicator in the last column
     char t[48];
-    snprintf(t, sizeof t, "%-15.15s%c", a, netIcon(netNow.state));
+    snprintf(t, sizeof t, "%-15.15s%c", a, netIcon(netNow));
     row(0, t);
   } else {
     row(0, a);
@@ -248,10 +247,10 @@ void drawMenu() {
 
   if (menuIdx == 0) {
     snprintf(a, sizeof a, "> Max Supply");
-    snprintf(b, sizeof b, "  %u.%u kW", s.maxSupplyDeciKw / 10, s.maxSupplyDeciKw % 10);
+    snprintf(b, sizeof b, "  %u.%u kW", (unsigned)(s.maxSupplyW / 1000), (unsigned)((s.maxSupplyW % 1000) / 100));
   } else if (menuIdx <= NCH) {
     snprintf(a, sizeof a, "> CH%u Priority", menuIdx);
-    snprintf(b, sizeof b, "  %s", priorityName(s.prio[menuIdx - 1]));
+    snprintf(b, sizeof b, "  %s", priorityName(s.relay[menuIdx - 1].prio));
   } else if (menuIdx == NCH + 1) {
     snprintf(a, sizeof a, "> WiFi Setup");
     snprintf(b, sizeof b, "  (hold to start)");

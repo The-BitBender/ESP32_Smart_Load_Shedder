@@ -4,7 +4,7 @@
 
 namespace loadmgr {
 
-struct Event {                 // last shed / restore action, for the LCD banner
+struct Event {                 // last relay action, for the LCD banner
   uint32_t id = 0;
   char line1[17] = {0};
   char line2[17] = {0};

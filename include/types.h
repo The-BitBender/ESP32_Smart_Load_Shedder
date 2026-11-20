@@ -1,11 +1,12 @@
 #pragma once
 #include <Arduino.h>
+#include <time.h>
 #include "config.h"
 
 // NOTE: Arduino defines LOW/HIGH as macros, hence Low/Medium/High (case sensitive).
 enum class Priority : uint8_t { Low = 0, Medium = 1, High = 2 };
 
-inline const char* priorityName(Priority p) {
+inline const char* priorityName(Priority p) {       // also the wire format ("LOW"/"MEDIUM"/"HIGH")
   switch (p) {
     case Priority::Low:    return "LOW";
     case Priority::Medium: return "MEDIUM";
@@ -27,15 +28,7 @@ struct Metrics {
 
 enum class SupplyState : uint8_t { Normal, Overload, Undervolt, SensorFault };
 
-inline const char* supplyStateName(SupplyState s) {   // used in telemetry
-  switch (s) {
-    case SupplyState::Normal:      return "NORMAL";
-    case SupplyState::Overload:    return "OVERLOAD";
-    case SupplyState::Undervolt:   return "LOW_VOLTAGE";
-    default:                       return "SENSOR_FAULT";
-  }
-}
-inline const char* supplyStateLcd(SupplyState s) {    // used on the 16x2 LCD
+inline const char* supplyStateLcd(SupplyState s) {
   switch (s) {
     case SupplyState::Normal:      return "NORMAL";
     case SupplyState::Overload:    return "OVERLOAD";
@@ -47,6 +40,22 @@ inline const char* supplyStateLcd(SupplyState s) {    // used on the 16x2 LCD
 // Rollover-safe "has time t been reached" check.
 inline bool reached(uint32_t now, uint32_t t) { return (int32_t)(now - t) >= 0; }
 
+// Local minutes since midnight, or -1 until NTP has set the clock.
+inline int minutesOfDayLocal() {
+  const time_t t = time(nullptr);
+  if (t < 1700000000) return -1;
+  struct tm tmv;
+  localtime_r(&t, &tmv);
+  return tmv.tm_hour * 60 + tmv.tm_min;
+}
+
+// Inclusive window [start, end] in minutes; wraps past midnight; start == end means "all day".
+inline bool inWindow(int now, uint16_t start, uint16_t end) {
+  if (start == end) return true;
+  if (start < end)  return now >= start && now <= end;
+  return now >= start || now <= end;
+}
+
 struct ChannelInfo {
   Priority prio;
   bool     on;
@@ -57,9 +66,11 @@ struct ChannelInfo {
 
 struct Snapshot {
   Metrics     m;
-  uint16_t    maxSupplyDeciKw = cfg::DEFAULT_SUPPLY_DECI_KW;
+  uint32_t    maxSupplyW = cfg::DEFAULT_SUPPLY_W;
   float       loadPct = 0;
   SupplyState state = SupplyState::Normal;
+  bool        sheddingActive = false;     // at least one channel is currently shed
+  uint32_t    configVersion = 0;          // last settings version applied (sent as ackedConfigVersion)
   ChannelInfo ch[cfg::NUM_CHANNELS];
   uint32_t    uptimeS = 0;
 };
